@@ -33,7 +33,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--fps", type=int, default=100)
 ap.add_argument("--mbit", type=float, default=0, help="bitrate, default 40 (hardware) or 20 (--x264)")
 ap.add_argument("--secs", type=float, default=0)
-ap.add_argument("--screen", default="0")
+ap.add_argument("--screen", default="0", help="display index, or 'auto' to pick the virtual Goggles display (matches WxH, else first non-main)")
 ap.add_argument("--record", default="", help="debug: also save the sent H.264 to this file (+ .csv with times)")
 ap.add_argument("--app", default="", help="capture only this app's window (name substring), e.g. --app minecraft")
 ap.add_argument("--start-bridge", action="store_true")
@@ -45,6 +45,8 @@ ap.add_argument("--vt", action="store_true", help="ffmpeg h264_videotoolbox (add
 ap.add_argument("--x264", action="store_true", help="old path: sckcap -> ffmpeg libx264 (CPU). Default is bin/sckenc (hardware, newest frame only)")
 ap.add_argument("--disp-ts", default="", help="EYEPIECE_DISP_TS for --start-bridge: keep|zero|now")
 ap.add_argument("--bridge-opts", default="", help="extra eyepiece_bridge options, e.g. '-O fb'")
+ap.add_argument("--preset", default="veryfast", help="x264 preset (default veryfast; was ultrafast). "
+                "veryfast = sharper at the same bitrate, ~2.4 ms/frame encode (still fine for low latency).")
 args = ap.parse_args()
 
 
@@ -130,6 +132,13 @@ if SCKENC:
     if not os.path.exists(SCKENC_BIN) or os.path.getmtime(SCKENC_BIN) < os.path.getmtime(src):
         print("building bin/sckenc...", flush=True)
         subprocess.run(["swiftc", "-O", "-o", SCKENC_BIN, src], check=True)
+        # Re-sign with a stable code-signing identity IF one is configured, so the macOS
+        # Screen-Recording TCC grant survives the rebuild (a plain swiftc build is ad-hoc — new
+        # cdhash → grant lost). Set env SCKENC_SIGN_ID to your signing identity (a cert SHA-1 or
+        # its name). If unset, the binary stays ad-hoc — fine unless you depend on a persistent grant.
+        sign_id = os.environ.get("SCKENC_SIGN_ID")
+        if sign_id:
+            subprocess.run(["codesign", "-s", sign_id, "--force", SCKENC_BIN], check=False)
 enc = subprocess.Popen([SCKENC_BIN, str(W), str(H), str(args.fps), args.screen, str(kbit), str(args.gop), args.app],
                        stdout=subprocess.PIPE, bufsize=0, env={**__import__("os").environ, "SCKENC_STATS": "1"}) if SCKENC else None
 cap = None if (args.source or args.avf or SCKENC) else subprocess.Popen(
@@ -143,7 +152,7 @@ ff = None if SCKENC else subprocess.Popen(
      "-vf", f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2",
      "-fps_mode", "cfr", "-r", str(args.fps),  # repeat frames when macOS sends none (idle screen)
      *(["-c:v", "h264_videotoolbox", "-realtime", "1", "-prio_speed", "1"] if args.vt else
-       ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-x264-params", "slices=1",
+       ["-c:v", "libx264", "-preset", args.preset, "-tune", "zerolatency", "-x264-params", "slices=1",
         "-pix_fmt", "yuv420p"]),
      "-profile:v", "high", "-bf", "0", "-g", str(args.gop or args.fps * 2),
      "-b:v", f"{kbit}k", "-maxrate", f"{kbit}k", "-bufsize", f"{kbit // 4}k",

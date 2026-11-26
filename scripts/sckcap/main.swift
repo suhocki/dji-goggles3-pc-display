@@ -11,7 +11,19 @@ let args = CommandLine.arguments
 let W = args.count > 1 ? Int(args[1])! : 1920
 let H = args.count > 2 ? Int(args[2])! : 1080
 let FPS = args.count > 3 ? Int(args[3])! : 60
-let displayIndex = args.count > 4 ? Int(args[4])! : 0
+let screenArg = args.count > 4 ? args[4] : "0"
+
+// Pick the display: "auto" -> the one matching WxH (the virtual "Goggles" display), else the first
+// non-main display, else index 0. Otherwise a numeric index into SCShareableContent.displays.
+func pickDisplay(_ displays: [SCDisplay]) -> SCDisplay {
+    if screenArg == "auto" {
+        if let d = displays.first(where: { $0.width == W && $0.height == H }) { return d }
+        if let d = displays.first(where: { CGDisplayIsMain($0.displayID) == 0 }) { return d }
+        return displays[0]
+    }
+    let i = Int(screenArg) ?? 0
+    return i < displays.count ? displays[i] : displays[0]
+}
 
 setvbuf(stdout, nil, _IONBF, 0)
 signal(SIGPIPE, SIG_IGN)
@@ -48,40 +60,81 @@ final class Output: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         }
-        lock.lock(); lastFrame = d; newFrames += 1; write(d); lock.unlock()
+        lock.lock(); lastFrame = d; newFrames += 1; stopsSinceFrame = 0; write(d); lock.unlock()
     }
+    // SCK stops the stream on e.g. -3805 "application connection being interrupted" or when the captured display
+    // goes away. Not fatal: the filler keeps repeating the last frame while the stream is rebuilt from fresh
+    // SCShareableContent (the virtual display gets a new ID when re-created).
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        FileHandle.standardError.write("sckcap: stream stopped: \(error)\n".data(using: .utf8)!)
-        exit(1)
+        lock.lock(); if activeStream === stream { activeStream = nil }; stopsSinceFrame += 1; let n = stopsSinceFrame; lock.unlock()
+        if n > MAXRESTARTS { err("sckcap: stream stopped: \(error) — \(n) stops without a frame in between, giving up"); exit(1) }
+        err("sckcap: stream stopped: \(error) — restarting capture")
+        restartStream()
     }
 }
 
+func err(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 let output = Output()
-var stream: SCStream?
+var activeStream: SCStream?
+var capturedDisplayID: CGDirectDisplayID = 0  // display of the last successful start: re-attach to the same one on restart
+var stopsSinceFrame = 0  // consecutive didStopWithError without a new frame arriving in between
+let MAXRESTARTS = 8
+
+func startStream() async throws -> SCDisplay {
+    var content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+    guard !content.displays.isEmpty else { throw NSError(domain: "sckcap", code: 1, userInfo: [NSLocalizedDescriptionKey: "no displays"]) }
+    // On restart prefer the display we had; in auto mode give a (re)created virtual display up to ~5 s to be listed.
+    func pick() -> SCDisplay? {
+        if capturedDisplayID != 0, let d = content.displays.first(where: { $0.displayID == capturedDisplayID }) { return d }
+        if screenArg == "auto", !content.displays.contains(where: { $0.width == W && $0.height == H }) { return nil }
+        return pickDisplay(content.displays)
+    }
+    var picked = pick()
+    for _ in 0..<10 where picked == nil {
+        try await Task.sleep(nanoseconds: 500_000_000)
+        content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        picked = pick()
+    }
+    let display = picked ?? pickDisplay(content.displays)
+    let filter = SCContentFilter(display: display, excludingWindows: [])
+    let cfg = SCStreamConfiguration()
+    cfg.width = W
+    cfg.height = H
+    cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(FPS))
+    cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange  // copied out in the callback, the SCK buffer is never held
+    cfg.showsCursor = true
+    cfg.queueDepth = 3
+    cfg.scalesToFit = true
+    cfg.preservesAspectRatio = true
+    cfg.backgroundColor = .black
+    let s = SCStream(filter: filter, configuration: cfg, delegate: output)
+    try s.addStreamOutput(output, type: .screen, sampleHandlerQueue: DispatchQueue(label: "cap", qos: .userInteractive))
+    try await s.startCapture()
+    lock.lock(); activeStream = s; capturedDisplayID = display.displayID; lock.unlock()
+    return display
+}
+
+// Rebuild the stream after didStopWithError: backoff 0.5 s doubling to 4 s, up to MAXRESTARTS attempts per stop.
+func restartStream() {
+    Task {
+        for attempt in 1...MAXRESTARTS {
+            try? await Task.sleep(nanoseconds: UInt64(min(4.0, 0.5 * pow(2.0, Double(attempt - 1))) * 1e9))
+            do {
+                let d = try await startStream()
+                err("sckcap: capture restarted (attempt \(attempt)): display \(d.displayID) \(d.width)x\(d.height)")
+                return
+            } catch { err("sckcap: restart attempt \(attempt) failed: \(error)") }
+        }
+        err("sckcap: could not restart capture after \(MAXRESTARTS) attempts"); exit(1)
+    }
+}
 
 Task {
     do {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard displayIndex < content.displays.count else { fatalError("no display \(displayIndex)") }
-        let display = content.displays[displayIndex]
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-        let cfg = SCStreamConfiguration()
-        cfg.width = W
-        cfg.height = H
-        cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(FPS))
-        cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        cfg.showsCursor = true
-        cfg.queueDepth = 3
-        cfg.scalesToFit = true
-        cfg.preservesAspectRatio = true
-        cfg.backgroundColor = .black
-        let s = SCStream(filter: filter, configuration: cfg, delegate: output)
-        try s.addStreamOutput(output, type: .screen, sampleHandlerQueue: DispatchQueue(label: "cap", qos: .userInteractive))
-        try await s.startCapture()
-        stream = s
-        FileHandle.standardError.write("sckcap: capturing display \(display.displayID) \(display.width)x\(display.height) -> \(W)x\(H)@\(FPS)\n".data(using: .utf8)!)
+        let display = try await startStream()
+        err("sckcap: capturing display \(display.displayID) \(display.width)x\(display.height) -> \(W)x\(H)@\(FPS)")
     } catch {
-        FileHandle.standardError.write("sckcap: \(error)\n".data(using: .utf8)!)
+        err("sckcap: \(error)")
         exit(1)
     }
 }
@@ -94,7 +147,7 @@ Thread {
         usleep(1000)
         lock.lock()
         let since = Double(DispatchTime.now().uptimeNanoseconds - lastWrite.uptimeNanoseconds) / 1e9
-        if stream != nil && since >= interval { repeats += 1; write(lastFrame) }
+        if capturedDisplayID != 0 && since >= interval { repeats += 1; write(lastFrame) }  // also while a restart is pending
         lock.unlock()
     }
 }.start()

@@ -7,8 +7,10 @@
 // Times are mach uptime ns (same clock as Python time.monotonic_ns() on macOS).
 //
 // Usage: sckenc [width] [height] [fps] [displayIndex] [kbit] [gopFrames] [appName]
-// Env: SCKENC_STATS=1 prints per-2s stats to stderr, SCKENC_INFLIGHT=n frames in the encoder (default 2),
-// SCKENC_LL=1 low-latency rate control, SCKENC_RT=1 RealTime (both slower on M1 Pro, see makeSession).
+// Env: SCKENC_STATS=1 prints per-3s stats to stderr, SCKENC_INFLIGHT=n frames in the encoder (default 2),
+// SCKENC_LL=1 low-latency rate control, SCKENC_RT=1 RealTime (both slower on M1 Pro, see makeSession),
+// SCKENC_NV12=1 capture NV12 instead of BGRA (breaks the virtual display, see PIXFMT).
+// If ScreenCaptureKit stops the stream (e.g. -3805 "connection interrupted"), capture is restarted automatically.
 import Foundation
 import ScreenCaptureKit
 import CoreMedia
@@ -17,7 +19,8 @@ import VideoToolbox
 
 let a = CommandLine.arguments
 func arg(_ i: Int, _ d: Int) -> Int { a.count > i ? Int(a[i]) ?? d : d }
-let W = arg(1, 1920), H = arg(2, 1080), FPS = arg(3, 100), displayIndex = arg(4, 0)
+let W = arg(1, 1920), H = arg(2, 1080), FPS = arg(3, 100)
+let screenArg = a.count > 4 ? a[4] : "0"  // "auto" -> pick the virtual "Goggles" display (WxH / non-main)
 let KBIT = arg(5, 40000), GOP = arg(6, 0)
 let APP = a.count > 7 ? a[7].lowercased() : ""  // capture only this app's biggest window (name substring)
 
@@ -315,60 +318,121 @@ final class Output: NSObject, SCStreamOutput, SCStreamDelegate {
         latestIsNew = true
         st.new += 1
         let tn = nowNs(); if lastNew > 0 { stall("no new frame from macOS capture", Double(tn - lastNew) / 1e6) }; lastNew = tn
+        stopsSinceFrame = 0
         lock.unlock()
         kick()
     }
-    func stream(_ stream: SCStream, didStopWithError error: Error) { log("sckenc: stream stopped: \(error)"); exit(1) }
+    // SCK stops the stream on e.g. -3805 "application connection being interrupted" (seen ~1 min into capturing the
+    // virtual display) or when the captured display goes away. Not fatal: the idle filler keeps repeating the last
+    // frame, and we rebuild the stream from fresh SCShareableContent (the virtual display gets a new ID when re-created).
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        lock.lock(); if activeStream === stream { activeStream = nil }; stopsSinceFrame += 1; let n = stopsSinceFrame; lock.unlock()
+        if n > MAXRESTARTS { log("sckenc: stream stopped: \(error) — \(n) stops without a single frame in between, giving up"); exit(1) }
+        log("sckenc: stream stopped: \(error) — restarting capture")
+        restartStream()
+    }
 }
 
 let output = Output()
-var stream: SCStream?
+var activeStream: SCStream?
+var capturedDisplayID: CGDirectDisplayID = 0  // display of the last successful start: re-attach to the same one on restart
+var stopsSinceFrame = 0  // consecutive didStopWithError without a new frame arriving in between
+let MAXRESTARTS = 8
+// SCK hands out two IOSurfaces in rotation. When the stream delivers NV12 1:1 from the virtual display and VideoToolbox
+// encodes that surface directly, SCK delivers exactly ONE frame and then nothing more (bisected 2026-11-25 on macOS 27.2.1:
+// no encoder -> 83 fps, BGRA -> 73-95 fps, NV12 -> 1 frame; the real display is unaffected). Assumption: the hardware
+// encoder keeps the NV12 input surface in use as its reference picture and SCK waits for it. BGRA input costs the
+// encoder ~0.4 ms more per frame (5.3 vs 4.9 ms) and the conversion happens on the GPU. SCKENC_NV12=1 restores the old format.
+let PIXFMT = ProcessInfo.processInfo.environment["SCKENC_NV12"] != nil ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_32BGRA
 makeSession()
+
+// Pick the display. "auto": the display we captured before (same ID), else the one matching WxH (the virtual "Goggles"
+// display), else the first non-main, else index 0. Numeric: that index into SCShareableContent.displays.
+func pickDisplay(_ displays: [SCDisplay]) -> SCDisplay? {
+    if capturedDisplayID != 0, let d = displays.first(where: { $0.displayID == capturedDisplayID }) { return d }
+    if screenArg == "auto" {
+        if let d = displays.first(where: { $0.width == W && $0.height == H }) { return d }
+        return nil  // caller retries: SCShareableContent sometimes omits the virtual display for a moment
+    }
+    let i = Int(screenArg) ?? 0
+    return i < displays.count ? displays[i] : displays[0]
+}
+
+func startStream() async throws -> String {
+    var content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+    guard !content.displays.isEmpty else { throw NSError(domain: "sckenc", code: 1, userInfo: [NSLocalizedDescriptionKey: "no displays"]) }
+    var picked = pickDisplay(content.displays)
+    for _ in 0..<10 where picked == nil {  // auto: give a (re)created virtual display up to ~5 s to show up
+        try await Task.sleep(nanoseconds: 500_000_000)
+        content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        picked = pickDisplay(content.displays)
+    }
+    let display: SCDisplay
+    if let p = picked { display = p } else {
+        display = content.displays.first(where: { CGDisplayIsMain($0.displayID) == 0 }) ?? content.displays[0]
+        log("sckenc: no \(W)x\(H) display found, falling back to display \(display.displayID) \(display.width)x\(display.height)")
+    }
+    let cfg = SCStreamConfiguration()
+    cfg.width = W
+    cfg.height = H
+    cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(FPS))
+    cfg.pixelFormat = PIXFMT
+    cfg.showsCursor = true
+    cfg.queueDepth = 5
+    cfg.scalesToFit = true
+    cfg.preservesAspectRatio = true
+    cfg.backgroundColor = .black
+    var filter = SCContentFilter(display: display, excludingWindows: [])
+    var what = "display \(display.displayID) \(display.width)x\(display.height)"
+    if !APP.isEmpty {
+        // A fullscreen game lives in its own Space, so it is not "on screen" while Terminal is in front:
+        // search all windows, by app name, bundle id or window title.
+        func match(_ w: SCWindow) -> Bool {
+            let keys = [w.owningApplication?.applicationName, w.owningApplication?.bundleIdentifier, w.title]
+            return w.frame.width > 300 && w.frame.height > 200 && keys.contains { ($0 ?? "").lowercased().contains(APP) }
+        }
+        var found: SCWindow?
+        for i in 0..<30 {  // the game may still be starting
+            let all = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+            found = all.windows.filter(match).max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+            if found != nil { break }
+            if i == 0 {
+                let apps = Set(all.windows.filter { $0.frame.width > 300 }.compactMap { $0.owningApplication?.applicationName }).sorted()
+                log("sckenc: no window for '\(APP)' yet, waiting. Apps with windows: \(apps.joined(separator: ", "))")
+            }
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+        // Throw (don't exit) so the restart path can retry: the window may be briefly absent during a rebuild.
+        guard let w = found else { throw NSError(domain: "sckenc", code: 2, userInfo: [NSLocalizedDescriptionKey: "no window for '\(APP)'"]) }
+        filter = SCContentFilter(desktopIndependentWindow: w)
+        what = "window '\(w.title ?? "")' of \(w.owningApplication?.applicationName ?? "") \(Int(w.frame.width))x\(Int(w.frame.height))"
+    }
+    let s = SCStream(filter: filter, configuration: cfg, delegate: output)
+    try s.addStreamOutput(output, type: .screen, sampleHandlerQueue: DispatchQueue(label: "cap", qos: .userInteractive))
+    try await s.startCapture()
+    lock.lock(); activeStream = s; capturedDisplayID = display.displayID; lock.unlock()
+    return what
+}
+
+// Rebuild the stream after didStopWithError: backoff 0.5 s doubling to 4 s, up to MAXRESTARTS attempts per stop.
+func restartStream() {
+    Task {
+        for attempt in 1...MAXRESTARTS {
+            try? await Task.sleep(nanoseconds: UInt64(min(4.0, 0.5 * pow(2.0, Double(attempt - 1))) * 1e9))
+            do {
+                let what = try await startStream()
+                log("sckenc: capture restarted (attempt \(attempt)): \(what)")
+                return
+            } catch { log("sckenc: restart attempt \(attempt) failed: \(error)") }
+        }
+        log("sckenc: could not restart capture after \(MAXRESTARTS) attempts"); exit(1)
+    }
+}
 
 Task {
     do {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard displayIndex < content.displays.count else { log("sckenc: no display \(displayIndex)"); exit(1) }
-        let display = content.displays[displayIndex]
-        let cfg = SCStreamConfiguration()
-        cfg.width = W
-        cfg.height = H
-        cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(FPS))
-        cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        cfg.showsCursor = true
-        cfg.queueDepth = 5
-        cfg.scalesToFit = true
-        cfg.preservesAspectRatio = true
-        cfg.backgroundColor = .black
-        var filter = SCContentFilter(display: display, excludingWindows: [])
-        var what = "display \(display.displayID) \(display.width)x\(display.height)"
-        if !APP.isEmpty {
-            // A fullscreen game lives in its own Space, so it is not "on screen" while Terminal is in front:
-            // search all windows, by app name, bundle id or window title.
-            func match(_ w: SCWindow) -> Bool {
-                let keys = [w.owningApplication?.applicationName, w.owningApplication?.bundleIdentifier, w.title]
-                return w.frame.width > 300 && w.frame.height > 200 && keys.contains { ($0 ?? "").lowercased().contains(APP) }
-            }
-            var found: SCWindow?
-            for i in 0..<30 {  // the game may still be starting
-                let all = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
-                found = all.windows.filter(match).max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
-                if found != nil { break }
-                if i == 0 {
-                    let apps = Set(all.windows.filter { $0.frame.width > 300 }.compactMap { $0.owningApplication?.applicationName }).sorted()
-                    log("sckenc: no window for '\(APP)' yet, waiting. Apps with windows: \(apps.joined(separator: ", "))")
-                }
-                try await Task.sleep(nanoseconds: 2_000_000_000)
-            }
-            guard let w = found else { log("sckenc: no window for '\(APP)'"); exit(1) }
-            filter = SCContentFilter(desktopIndependentWindow: w)
-            what = "window '\(w.title ?? "")' of \(w.owningApplication?.applicationName ?? "") \(Int(w.frame.width))x\(Int(w.frame.height))"
-        }
-        let s = SCStream(filter: filter, configuration: cfg, delegate: output)
-        try s.addStreamOutput(output, type: .screen, sampleHandlerQueue: DispatchQueue(label: "cap", qos: .userInteractive))
-        try await s.startCapture()
-        stream = s
-        log("sckenc: \(what) -> \(W)x\(H)@\(FPS), \(KBIT) kbit, VideoToolbox")
+        let what = try await startStream()
+        log("sckenc: \(what) -> \(W)x\(H)@\(FPS), \(KBIT) kbit, VideoToolbox, \(PIXFMT == kCVPixelFormatType_32BGRA ? "BGRA" : "NV12") capture")
     } catch { log("sckenc: \(error)"); exit(1) }
 }
 
